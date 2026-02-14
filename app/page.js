@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { supabase } from "./lib/supabaseClient";
+import { supabase } from "../lib/supabaseClient"; // ✅ correct path (lib is next to app)
 
 function round2(n) {
   if (n == null || Number.isNaN(n)) return 0;
@@ -20,7 +20,7 @@ export default function Home() {
   const [entries, setEntries] = useState([]); // [{ id, food_id, name, grams }]
 
   const [nutrientsById, setNutrientsById] = useState({}); // nutrient_id -> {name, unit}
-  const [foodNutrients, setFoodNutrients] = useState([]); // rows: {food_id, nutrient_id, value_per_100g}
+  const [foodNutrients, setFoodNutrients] = useState([]); // rows: {food_id, nutrient_id, amount_per_100g}
 
   const supabaseUrlPresent = !!process.env.NEXT_PUBLIC_SUPABASE_URL;
   const supabaseAnonPresent = !!process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
@@ -28,6 +28,7 @@ export default function Home() {
   // 1) Load foods (global) once
   useEffect(() => {
     let cancelled = false;
+
     (async () => {
       setFoodsLoading(true);
       setFoodsError(null);
@@ -45,30 +46,32 @@ export default function Home() {
       } else {
         setFoods(data || []);
       }
+
       setFoodsLoading(false);
     })();
+
     return () => {
       cancelled = true;
     };
   }, []);
 
-  // Filter foods for the dropdown (simple client-side filter)
+  // Filter foods for dropdown
   const filteredFoods = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return foods.slice(0, 200); // keep UI fast
+    if (!q) return foods.slice(0, 200);
     return foods
       .filter((f) => (f.name || "").toLowerCase().includes(q))
       .slice(0, 200);
   }, [foods, query]);
 
-  // Helper: find food name by id
+  // Helper: id -> name
   const foodNameById = useMemo(() => {
     const map = {};
     for (const f of foods) map[f.id] = f.name;
     return map;
   }, [foods]);
 
-  // 2) When entries change, load all nutrients for those foods
+  // 2) When entries change, load nutrients for those foods + metadata
   useEffect(() => {
     let cancelled = false;
 
@@ -76,13 +79,14 @@ export default function Home() {
       const foodIds = Array.from(new Set(entries.map((e) => e.food_id)));
       if (foodIds.length === 0) {
         setFoodNutrients([]);
+        setNutrientsById({});
         return;
       }
 
-      // Pull all nutrients for selected foods
+      // ✅ FIX: column is amount_per_100g (not value_per_100g)
       const { data: fnData, error: fnError } = await supabase
         .from("food_nutrients_global")
-        .select("food_id,nutrient_id,value_per_100g")
+        .select("food_id,nutrient_id,amount_per_100g")
         .in("food_id", foodIds);
 
       if (cancelled) return;
@@ -90,22 +94,23 @@ export default function Home() {
       if (fnError) {
         console.error(fnError);
         setFoodNutrients([]);
+        setNutrientsById({});
         return;
       }
 
       const rows = fnData || [];
       setFoodNutrients(rows);
 
-      // Pull nutrient metadata (name/unit) for nutrient_ids we saw
       const nutrientIds = Array.from(new Set(rows.map((r) => r.nutrient_id)));
       if (nutrientIds.length === 0) {
         setNutrientsById({});
         return;
       }
 
+      // ✅ FIX: nutrients table uses display_name (not name)
       const { data: nData, error: nError } = await supabase
         .from("nutrients")
-        .select("id,name,unit")
+        .select("id,display_name,unit")
         .in("id", nutrientIds);
 
       if (cancelled) return;
@@ -118,7 +123,7 @@ export default function Home() {
 
       const meta = {};
       for (const n of nData || []) {
-        meta[n.id] = { name: n.name, unit: n.unit };
+        meta[n.id] = { name: n.display_name, unit: n.unit };
       }
       setNutrientsById(meta);
     })();
@@ -130,23 +135,25 @@ export default function Home() {
 
   // 3) Compute totals per nutrient based on entries + foodNutrients
   const totals = useMemo(() => {
-    // Build grams by food_id
     const gramsByFood = {};
     for (const e of entries) {
-      gramsByFood[e.food_id] = (gramsByFood[e.food_id] || 0) + Number(e.grams || 0);
+      gramsByFood[e.food_id] =
+        (gramsByFood[e.food_id] || 0) + Number(e.grams || 0);
     }
 
-    // Sum nutrients
     const sumByNutrient = {}; // nutrient_id -> totalValue
     for (const row of foodNutrients) {
       const g = gramsByFood[row.food_id] || 0;
       if (!g) continue;
-      const v100 = Number(row.value_per_100g || 0);
+
+      // ✅ FIX: amount_per_100g
+      const v100 = Number(row.amount_per_100g || 0);
       const add = (v100 * g) / 100;
-      sumByNutrient[row.nutrient_id] = (sumByNutrient[row.nutrient_id] || 0) + add;
+
+      sumByNutrient[row.nutrient_id] =
+        (sumByNutrient[row.nutrient_id] || 0) + add;
     }
 
-    // Turn into list
     const list = Object.entries(sumByNutrient).map(([nutrient_id, value]) => {
       const meta = nutrientsById[nutrient_id] || {};
       return {
@@ -157,8 +164,7 @@ export default function Home() {
       };
     });
 
-    // Sort: name (for now)
-    list.sort((a, b) => a.name.localeCompare(b.name));
+    list.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
     return list;
   }, [entries, foodNutrients, nutrientsById]);
 
@@ -172,7 +178,10 @@ export default function Home() {
     setEntries((prev) => [
       ...prev,
       {
-        id: crypto.randomUUID(),
+        id:
+          typeof crypto !== "undefined" && crypto.randomUUID
+            ? crypto.randomUUID()
+            : String(Date.now()) + Math.random(),
         food_id: selectedFoodId,
         name,
         grams: g,
@@ -193,7 +202,14 @@ export default function Home() {
         <div>Anon key present: {supabaseAnonPresent ? "Yes" : "No"}</div>
       </div>
 
-      <section style={{ border: "1px solid #ddd", borderRadius: 8, padding: 16, marginBottom: 16 }}>
+      <section
+        style={{
+          border: "1px solid #ddd",
+          borderRadius: 8,
+          padding: 16,
+          marginBottom: 16,
+        }}
+      >
         <h2 style={{ marginTop: 0 }}>Add food</h2>
 
         {foodsLoading ? (
@@ -202,9 +218,18 @@ export default function Home() {
           <p style={{ color: "crimson" }}>Error loading foods: {foodsError}</p>
         ) : (
           <>
-            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+            <div
+              style={{
+                display: "flex",
+                gap: 12,
+                flexWrap: "wrap",
+                alignItems: "center",
+              }}
+            >
               <div style={{ minWidth: 280 }}>
-                <label style={{ display: "block", fontWeight: 600 }}>Search</label>
+                <label style={{ display: "block", fontWeight: 600 }}>
+                  Search
+                </label>
                 <input
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
@@ -214,7 +239,9 @@ export default function Home() {
               </div>
 
               <div style={{ minWidth: 320 }}>
-                <label style={{ display: "block", fontWeight: 600 }}>Food</label>
+                <label style={{ display: "block", fontWeight: 600 }}>
+                  Food
+                </label>
                 <select
                   value={selectedFoodId}
                   onChange={(e) => setSelectedFoodId(e.target.value)}
@@ -233,7 +260,9 @@ export default function Home() {
               </div>
 
               <div>
-                <label style={{ display: "block", fontWeight: 600 }}>Grams</label>
+                <label style={{ display: "block", fontWeight: 600 }}>
+                  Grams
+                </label>
                 <input
                   type="number"
                   value={grams}
@@ -245,7 +274,10 @@ export default function Home() {
               </div>
 
               <div style={{ marginTop: 22 }}>
-                <button onClick={addEntry} style={{ padding: "10px 14px", cursor: "pointer" }}>
+                <button
+                  onClick={addEntry}
+                  style={{ padding: "10px 14px", cursor: "pointer" }}
+                >
                   Add
                 </button>
               </div>
@@ -278,7 +310,7 @@ export default function Home() {
           <h2 style={{ marginTop: 0 }}>Totals (calculated)</h2>
 
           <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 8 }}>
-            This sums: value_per_100g × grams/100 across your selected foods.
+            This sums: amount_per_100g × grams/100 across your selected foods.
           </div>
 
           {entries.length === 0 ? (
@@ -303,11 +335,21 @@ export default function Home() {
               <tbody>
                 {totals.map((t) => (
                   <tr key={t.nutrient_id}>
-                    <td style={{ borderBottom: "1px solid #f3f3f3", padding: 6 }}>{t.name}</td>
-                    <td style={{ borderBottom: "1px solid #f3f3f3", padding: 6, textAlign: "right" }}>
+                    <td style={{ borderBottom: "1px solid #f3f3f3", padding: 6 }}>
+                      {t.name}
+                    </td>
+                    <td
+                      style={{
+                        borderBottom: "1px solid #f3f3f3",
+                        padding: 6,
+                        textAlign: "right",
+                      }}
+                    >
                       {round2(t.total)}
                     </td>
-                    <td style={{ borderBottom: "1px solid #f3f3f3", padding: 6 }}>{t.unit}</td>
+                    <td style={{ borderBottom: "1px solid #f3f3f3", padding: 6 }}>
+                      {t.unit}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -318,4 +360,3 @@ export default function Home() {
     </main>
   );
 }
-
