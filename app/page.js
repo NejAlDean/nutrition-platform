@@ -1,31 +1,42 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
 
 /**
- * IMPORTANT:
- * This app assumes:
- * - foods_global(id, name, price_per_100g)
- * - food_nutrients_global(food_id, nutrient_id, amount_per_100g)
- * - nutrients(id, key, display_name, unit)
+ * EXPECTED SUPABASE TABLES
+ * - foods_global: id, name, price_per_100g (price optional)
+ * - nutrients: id, key, display_name, unit, info_text, default_goal, default_max (some optional)
+ * - food_nutrients_global: food_id, nutrient_id, amount_per_100g
  *
- * We will build the spreadsheet columns using nutrients.key.
+ * If your nutrients table doesn't have default_goal/default_max/info_text, the UI still works,
+ * those fields will just show empty.
  */
 
-// ✅ EDIT THIS LIST to match your spreadsheet columns (order matters).
-// These keys must exist in nutrients.key.
-const COLUMNS = [
-  { key: "calories", label: "Kcal" },
-  { key: "protein", label: "Protein" },
-  { key: "carbs", label: "Carbs" },
-  { key: "fat", label: "Fat" },
-  { key: "fiber", label: "Fiber" },
-  { key: "sugar", label: "Sugar" },
-  { key: "cholesterol", label: "Cholesterol" },
-  { key: "omega_3", label: "Omega-3" },
-  { key: "omega_6", label: "Omega-6" },
+// Prefer showing these nutrients first (you can change to match your sheet)
+const PREFERRED_KEYS = [
+  "calories",
+  "energy_kcal",
+  "protein",
+  "fat",
+  "total_fat",
+  "carbs",
+  "fiber",
+  "sugar",
+  "cholesterol",
+  "omega_3",
+  "omega_6",
+  "sodium",
+  "potassium",
+  "vitamin_c",
+  "vitamin_a",
+  "magnesium",
+  "iron",
+  "b12",
+  "folate",
 ];
+
+const LS_KEY = "nutrition_targets_v1";
 
 function round(n, digits = 2) {
   if (n == null || Number.isNaN(n)) return 0;
@@ -33,227 +44,252 @@ function round(n, digits = 2) {
   return Math.round(n * p) / p;
 }
 
+function safeNum(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
+}
+
 export default function Page() {
-  // Foods
+  // Foods list (searches server-side to keep fast)
+  const [foodQuery, setFoodQuery] = useState("");
   const [foods, setFoods] = useState([]);
-  const [foodsLoading, setFoodsLoading] = useState(true);
-  const [foodsError, setFoodsError] = useState(null);
+  const [foodsLoading, setFoodsLoading] = useState(false);
+  const [foodsError, setFoodsError] = useState("");
 
   // Nutrients meta
-  const [nutrientIdByKey, setNutrientIdByKey] = useState({});
-  const [nutrientMetaById, setNutrientMetaById] = useState({}); // id -> {key,name,unit}
+  const [nutrients, setNutrients] = useState([]);
+  const [nutrientsLoading, setNutrientsLoading] = useState(true);
+  const [nutrientsError, setNutrientsError] = useState("");
 
-  // food nutrients (for selected foods only)
-  const [foodNutrients, setFoodNutrients] = useState([]);
+  // Selected diet rows
+  // { id, food_id, name, grams }
+  const [dietRows, setDietRows] = useState([]);
 
-  // Add UI
-  const [query, setQuery] = useState("");
+  // Targets (goals + max) per nutrient_id (editable)
+  // { [nutrient_id]: { goal: number|null, max: number|null } }
+  const [targets, setTargets] = useState({});
+
+  // Columns shown (nutrient_ids)
+  const [shownNutrientIds, setShownNutrientIds] = useState([]);
+
+  // Food nutrients rows
+  const [foodNutrientsRows, setFoodNutrientsRows] = useState([]);
+  const [foodNutrientsLoading, setFoodNutrientsLoading] = useState(false);
+  const [foodNutrientsError, setFoodNutrientsError] = useState("");
+
+  // Add food UI
   const [selectedFoodId, setSelectedFoodId] = useState("");
-  const [grams, setGrams] = useState(100);
+  const [gramsToAdd, setGramsToAdd] = useState(100);
 
-  // Spreadsheet rows
-  const [rows, setRows] = useState([]); // [{id, food_id, grams}]
+  // Info modal
+  const [infoModal, setInfoModal] = useState({ open: false, nutrient: null });
 
-  // Goals (per nutrient key)
-  const [goals, setGoals] = useState(() => {
-    const g = {};
-    for (const c of COLUMNS) g[c.key] = "";
-    return g;
-  });
-
-  // -----------------------------
-  // Load foods
-  // -----------------------------
+  // --- Load nutrients (once)
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      setFoodsLoading(true);
-      setFoodsError(null);
+      setNutrientsLoading(true);
+      setNutrientsError("");
 
       const { data, error } = await supabase
-        .from("foods_global")
-        .select("id,name,price_per_100g")
-        .order("name", { ascending: true });
+        .from("nutrients")
+        .select("id,key,display_name,unit,info_text,default_goal,default_max")
+        .order("display_name", { ascending: true });
 
       if (cancelled) return;
 
       if (error) {
-        setFoodsError(error.message);
+        setNutrientsError(error.message || String(error));
+        setNutrients([]);
+        setNutrientsLoading(false);
+        return;
+      }
+
+      const list = data || [];
+      setNutrients(list);
+      setNutrientsLoading(false);
+
+      // Determine default shown columns:
+      // 1) preferred keys that exist
+      // 2) if none match, first 10 nutrients
+      const idByKey = new Map(list.map((n) => [n.key, n.id]));
+      const preferredIds = [];
+      for (const k of PREFERRED_KEYS) {
+        const id = idByKey.get(k);
+        if (id) preferredIds.push(id);
+      }
+      const fallback = list.slice(0, 10).map((n) => n.id);
+      const initialShown = (preferredIds.length ? preferredIds : fallback).slice(0, 12);
+      setShownNutrientIds(initialShown);
+
+      // Load targets from localStorage, otherwise seed from defaults
+      let fromLS = null;
+      try {
+        const raw = localStorage.getItem(LS_KEY);
+        if (raw) fromLS = JSON.parse(raw);
+      } catch {}
+
+      if (fromLS && typeof fromLS === "object") {
+        setTargets(fromLS);
+      } else {
+        const seeded = {};
+        for (const n of list) {
+          seeded[n.id] = {
+            goal: safeNum(n.default_goal),
+            max: safeNum(n.default_max),
+          };
+        }
+        setTargets(seeded);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Persist targets to localStorage (so it behaves like spreadsheet edits)
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify(targets));
+    } catch {}
+  }, [targets]);
+
+  // --- Foods search (server-side)
+  const searchTimer = useRef(null);
+  useEffect(() => {
+    let cancelled = false;
+
+    // Debounce typing
+    if (searchTimer.current) clearTimeout(searchTimer.current);
+    searchTimer.current = setTimeout(async () => {
+      setFoodsLoading(true);
+      setFoodsError("");
+
+      let q = supabase
+        .from("foods_global")
+        .select("id,name,price_per_100g")
+        .order("name", { ascending: true })
+        .limit(50);
+
+      if (foodQuery.trim()) {
+        q = q.ilike("name", `%${foodQuery.trim()}%`);
+      }
+
+      const { data, error } = await q;
+
+      if (cancelled) return;
+
+      if (error) {
+        setFoodsError(error.message || String(error));
         setFoods([]);
       } else {
         setFoods(data || []);
       }
       setFoodsLoading(false);
-    })();
+    }, 250);
 
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [foodQuery]);
 
-  const foodById = useMemo(() => {
-    const m = {};
-    for (const f of foods) m[f.id] = f;
-    return m;
-  }, [foods]);
-
-  // -----------------------------
-  // Load nutrients meta (once)
-  // -----------------------------
+  // --- Fetch nutrient amounts for selected foods + shown nutrients
   useEffect(() => {
     let cancelled = false;
+
     (async () => {
-      const { data, error } = await supabase
-        .from("nutrients")
-        .select("id,key,display_name,unit");
+      const foodIds = Array.from(new Set(dietRows.map((r) => r.food_id)));
+      const nutrientIds = shownNutrientIds;
 
-      if (cancelled) return;
-
-      if (error) {
-        console.error(error);
-        setNutrientIdByKey({});
-        setNutrientMetaById({});
+      if (!foodIds.length || !nutrientIds.length) {
+        setFoodNutrientsRows([]);
         return;
       }
 
-      const byKey = {};
-      const byId = {};
-
-      for (const n of data || []) {
-        byKey[n.key] = n.id;
-        byId[n.id] = {
-          key: n.key,
-          name: n.display_name || n.key,
-          unit: n.unit || "",
-        };
-      }
-
-      setNutrientIdByKey(byKey);
-      setNutrientMetaById(byId);
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // -----------------------------
-  // Load nutrient rows for foods that are in the sheet
-  // -----------------------------
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const foodIds = Array.from(new Set(rows.map((r) => r.food_id)));
-      if (foodIds.length === 0) {
-        setFoodNutrients([]);
-        return;
-      }
+      setFoodNutrientsLoading(true);
+      setFoodNutrientsError("");
 
       const { data, error } = await supabase
         .from("food_nutrients_global")
         .select("food_id,nutrient_id,amount_per_100g")
-        .in("food_id", foodIds);
+        .in("food_id", foodIds)
+        .in("nutrient_id", nutrientIds);
 
       if (cancelled) return;
 
       if (error) {
-        console.error(error);
-        setFoodNutrients([]);
-        return;
+        setFoodNutrientsError(error.message || String(error));
+        setFoodNutrientsRows([]);
+      } else {
+        setFoodNutrientsRows(data || []);
       }
 
-      setFoodNutrients(data || []);
+      setFoodNutrientsLoading(false);
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [rows]);
+  }, [dietRows, shownNutrientIds]);
 
-  // Lookup: food_id -> nutrient_id -> amount_per_100g
-  const amount100 = useMemo(() => {
-    const m = {};
-    for (const r of foodNutrients) {
-      if (!m[r.food_id]) m[r.food_id] = {};
-      m[r.food_id][r.nutrient_id] = Number(r.amount_per_100g || 0);
+  // --- Lookups
+  const nutrientById = useMemo(() => {
+    const m = new Map();
+    for (const n of nutrients) m.set(n.id, n);
+    return m;
+  }, [nutrients]);
+
+  const amount100ByFoodAndNutrient = useMemo(() => {
+    // food_id -> nutrient_id -> amount_per_100g
+    const m = new Map();
+    for (const r of foodNutrientsRows) {
+      if (!m.has(r.food_id)) m.set(r.food_id, new Map());
+      m.get(r.food_id).set(r.nutrient_id, Number(r.amount_per_100g) || 0);
     }
     return m;
-  }, [foodNutrients]);
+  }, [foodNutrientsRows]);
 
-  // Dropdown filtering
-  const filteredFoods = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return foods.slice(0, 200);
-    return foods
-      .filter((f) => (f.name || "").toLowerCase().includes(q))
-      .slice(0, 200);
-  }, [foods, query]);
-
-  // -----------------------------
-  // Spreadsheet computed values
-  // -----------------------------
-  const computedRows = useMemo(() => {
-    return rows.map((r) => {
-      const food = foodById[r.food_id];
-      const gramsNum = Number(r.grams || 0);
+  // --- Spreadsheet cells: per row, per nutrient
+  const computedDietRows = useMemo(() => {
+    return dietRows.map((row) => {
+      const grams = Number(row.grams) || 0;
+      const foodMap = amount100ByFoodAndNutrient.get(row.food_id);
 
       const values = {};
-      for (const c of COLUMNS) {
-        const nid = nutrientIdByKey[c.key];
-        const v100 = nid ? Number(amount100[r.food_id]?.[nid] || 0) : 0;
-        values[c.key] = (v100 * gramsNum) / 100;
+      for (const nid of shownNutrientIds) {
+        const per100 = foodMap?.get(nid) ?? 0;
+        values[nid] = (per100 * grams) / 100;
       }
 
-      // omega ratio (if both present)
-      const o3 = values["omega_3"] || 0;
-      const o6 = values["omega_6"] || 0;
-      const ratio = o3 > 0 ? o6 / o3 : null;
-
-      return {
-        ...r,
-        foodName: food?.name || "Unknown food",
-        price_per_100g: food?.price_per_100g ?? null,
-        gramsNum,
-        values,
-        omegaRatio: ratio,
-      };
+      return { ...row, grams, values };
     });
-  }, [rows, foodById, nutrientIdByKey, amount100]);
+  }, [dietRows, amount100ByFoodAndNutrient, shownNutrientIds]);
 
-  // Totals per nutrient
-  const totals = useMemo(() => {
-    const t = {};
-    for (const c of COLUMNS) t[c.key] = 0;
+  // --- Totals per nutrient column
+  const totalsByNutrientId = useMemo(() => {
+    const totals = {};
+    for (const nid of shownNutrientIds) totals[nid] = 0;
 
-    for (const r of computedRows) {
-      for (const c of COLUMNS) t[c.key] += Number(r.values[c.key] || 0);
-    }
-    return t;
-  }, [computedRows]);
-
-  // Goal diff (total - goal)
-  const diffs = useMemo(() => {
-    const d = {};
-    for (const c of COLUMNS) {
-      const goal = Number(goals[c.key]);
-      if (!Number.isFinite(goal)) {
-        d[c.key] = null;
-      } else {
-        d[c.key] = totals[c.key] - goal;
+    for (const row of computedDietRows) {
+      for (const nid of shownNutrientIds) {
+        totals[nid] += Number(row.values[nid] || 0);
       }
     }
-    return d;
-  }, [goals, totals]);
 
-  // -----------------------------
-  // Actions
-  // -----------------------------
-  function addFoodRow() {
-    const g = Number(grams);
+    return totals;
+  }, [computedDietRows, shownNutrientIds]);
+
+  // --- Actions
+  function addFoodToDiet() {
+    const g = Number(gramsToAdd);
     if (!selectedFoodId) return;
     if (!Number.isFinite(g) || g <= 0) return;
 
-    setRows((prev) => [
+    const food = foods.find((f) => String(f.id) === String(selectedFoodId));
+    const name = food?.name || "Unknown food";
+
+    setDietRows((prev) => [
       ...prev,
       {
         id:
@@ -261,182 +297,229 @@ export default function Page() {
             ? crypto.randomUUID()
             : String(Date.now()) + Math.random(),
         food_id: selectedFoodId,
+        name,
         grams: g,
       },
     ]);
+
+    setSelectedFoodId("");
+    setGramsToAdd(100);
   }
 
-  function removeRow(id) {
-    setRows((prev) => prev.filter((r) => r.id !== id));
+  function removeDietRow(rowId) {
+    setDietRows((prev) => prev.filter((r) => r.id !== rowId));
   }
 
-  function updateRowGrams(id, value) {
-    const g = Number(value);
-    setRows((prev) => prev.map((r) => (r.id === id ? { ...r, grams: g } : r)));
+  function updateDietRowGrams(rowId, grams) {
+    const g = Number(grams);
+    setDietRows((prev) =>
+      prev.map((r) => (r.id === rowId ? { ...r, grams: g } : r))
+    );
   }
 
-  function updateGoal(key, value) {
-    setGoals((prev) => ({ ...prev, [key]: value }));
+  function setTarget(nutrientId, field, value) {
+    const n = safeNum(value);
+    setTargets((prev) => ({
+      ...prev,
+      [nutrientId]: {
+        goal: prev?.[nutrientId]?.goal ?? null,
+        max: prev?.[nutrientId]?.max ?? null,
+        [field]: n,
+      },
+    }));
   }
 
-  // -----------------------------
-  // Styles: spreadsheet feel
-  // -----------------------------
-  const box = {
-    border: "1px solid #ddd",
-    borderRadius: 10,
-    background: "#fff",
-  };
+  function resetTargetsToDefaults() {
+    const seeded = {};
+    for (const n of nutrients) {
+      seeded[n.id] = {
+        goal: safeNum(n.default_goal),
+        max: safeNum(n.default_max),
+      };
+    }
+    setTargets(seeded);
+  }
 
-  const cell = {
-    padding: "10px 10px",
-    borderBottom: "1px solid #eee",
-    borderRight: "1px solid #eee",
-    textAlign: "right",
-    whiteSpace: "nowrap",
-  };
+  function toggleColumn(nutrientId) {
+    setShownNutrientIds((prev) =>
+      prev.includes(nutrientId)
+        ? prev.filter((x) => x !== nutrientId)
+        : [...prev, nutrientId]
+    );
+  }
 
-  const headCell = {
-    ...cell,
-    fontWeight: 800,
-    background: "#f5f5f5",
-    position: "sticky",
-    top: 0,
-    zIndex: 1,
-  };
+  function openInfo(nutrientId) {
+    setInfoModal({ open: true, nutrient: nutrientById.get(nutrientId) || null });
+  }
 
-  const leftCell = { ...cell, textAlign: "left" };
+  // --- Professional UI helpers (color rules)
+  function exceedsMax(nutrientId) {
+    const max = targets?.[nutrientId]?.max;
+    if (max == null) return false;
+    return (totalsByNutrientId[nutrientId] || 0) > max;
+  }
 
-  const inputSmall = {
-    width: 90,
-    padding: 6,
-    borderRadius: 8,
-    border: "1px solid #ccc",
-    textAlign: "right",
-  };
-
+  // --- Render
   return (
-    <main style={{ padding: 24, fontFamily: "system-ui, Arial", background: "#fafafa" }}>
-      <div style={{ maxWidth: 1200, margin: "0 auto" }}>
-        <h1 style={{ margin: 0 }}>Nutrition Platform</h1>
+    <main className="wrap">
+      <header className="header">
+        <div>
+          <h1 className="title">Diet Builder</h1>
+          <div className="subtitle">
+            Spreadsheet-style diet sheet: foods → grams → totals vs goals/max.
+          </div>
+        </div>
 
-        {/* ADD ROW (simple + aligned) */}
-        <div style={{ ...box, padding: 16, marginTop: 16 }}>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1.2fr 0.4fr 0.25fr", gap: 12, alignItems: "end" }}>
-            <div>
-              <div style={{ fontWeight: 800, marginBottom: 6 }}>Search</div>
-              <input
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Type to filter foods…"
-                style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ccc" }}
-              />
+        <button className="btn ghost" onClick={resetTargetsToDefaults}>
+          Reset goals/max to defaults
+        </button>
+      </header>
+
+      {/* Add food */}
+      <section className="card">
+        <div className="cardTitle">Add food</div>
+
+        <div className="gridAdd">
+          <div>
+            <label className="label">Search foods</label>
+            <input
+              className="input"
+              value={foodQuery}
+              onChange={(e) => setFoodQuery(e.target.value)}
+              placeholder="Type food name…"
+            />
+            <div className="hint">
+              {foodsLoading ? "Searching…" : foodsError ? foodsError : `Showing ${foods.length} foods`}
             </div>
+          </div>
 
-            <div>
-              <div style={{ fontWeight: 800, marginBottom: 6 }}>Food</div>
-              {foodsLoading ? (
-                <div>Loading…</div>
-              ) : foodsError ? (
-                <div style={{ color: "crimson" }}>{foodsError}</div>
-              ) : (
-                <select
-                  value={selectedFoodId}
-                  onChange={(e) => setSelectedFoodId(e.target.value)}
-                  style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ccc" }}
-                >
-                  <option value="">Select…</option>
-                  {filteredFoods.map((f) => (
-                    <option key={f.id} value={f.id}>
-                      {f.name}
-                    </option>
-                  ))}
-                </select>
-              )}
-              <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
-                Showing {filteredFoods.length} foods (max 200)
-              </div>
-            </div>
-
-            <div>
-              <div style={{ fontWeight: 800, marginBottom: 6 }}>Grams</div>
-              <input
-                type="number"
-                value={grams}
-                onChange={(e) => setGrams(e.target.value)}
-                min={1}
-                step={1}
-                style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ccc" }}
-              />
-            </div>
-
-            <button
-              onClick={addFoodRow}
-              style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #bbb", cursor: "pointer" }}
+          <div>
+            <label className="label">Food</label>
+            <select
+              className="input"
+              value={selectedFoodId}
+              onChange={(e) => setSelectedFoodId(e.target.value)}
             >
+              <option value="">Select…</option>
+              {foods.map((f) => (
+                <option key={f.id} value={f.id}>
+                  {f.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="label">Grams</label>
+            <input
+              className="input"
+              type="number"
+              min="1"
+              step="1"
+              value={gramsToAdd}
+              onChange={(e) => setGramsToAdd(e.target.value)}
+            />
+          </div>
+
+          <div className="addBtnWrap">
+            <button className="btn" onClick={addFoodToDiet}>
               Add
             </button>
           </div>
         </div>
+      </section>
 
-        {/* SPREADSHEET */}
-        <div style={{ ...box, marginTop: 16, overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: 0, minWidth: 1000 }}>
+      {/* Column chooser */}
+      <section className="card">
+        <div className="cardTitle">Columns</div>
+
+        {nutrientsLoading ? (
+          <div className="hint">Loading nutrients…</div>
+        ) : nutrientsError ? (
+          <div className="error">{nutrientsError}</div>
+        ) : (
+          <div className="pillWrap">
+            {nutrients.map((n) => (
+              <button
+                key={n.id}
+                className={`pill ${shownNutrientIds.includes(n.id) ? "pillOn" : ""}`}
+                onClick={() => toggleColumn(n.id)}
+                title="Show/hide column"
+              >
+                {n.display_name || n.key}
+              </button>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {/* Diet sheet */}
+      <section className="card">
+        <div className="cardTitleRow">
+          <div className="cardTitle">Diet sheet</div>
+          <div className="hint">
+            {foodNutrientsLoading ? "Loading nutrient values…" : foodNutrientsError ? foodNutrientsError : ""}
+          </div>
+        </div>
+
+        <div className="tableWrap">
+          <table className="table">
             <thead>
               <tr>
-                <th style={{ ...headCell, textAlign: "left" }}>Food</th>
-                <th style={headCell}>g</th>
-                {COLUMNS.map((c) => {
-                  const id = nutrientIdByKey[c.key];
-                  const meta = id ? nutrientMetaById[id] : null;
-                  const unit = meta?.unit ? ` (${meta.unit})` : "";
+                <th className="th left">Food</th>
+                <th className="th right">g</th>
+
+                {shownNutrientIds.map((nid) => {
+                  const n = nutrientById.get(nid);
+                  const label = n?.display_name || n?.key || nid;
+                  const unit = n?.unit ? ` (${n.unit})` : "";
                   return (
-                    <th key={c.key} style={headCell}>
-                      {c.label}{unit}
+                    <th key={nid} className="th right">
+                      <div className="thFlex">
+                        <span>{label}{unit}</span>
+                        <button className="iconBtn" onClick={() => openInfo(nid)} title="Info">
+                          i
+                        </button>
+                      </div>
                     </th>
                   );
                 })}
-                <th style={headCell}>Ω6/Ω3</th>
-                <th style={{ ...headCell, borderRight: "none" }} />
+
+                <th className="th center"> </th>
               </tr>
             </thead>
 
             <tbody>
-              {computedRows.length === 0 ? (
+              {computedDietRows.length === 0 ? (
                 <tr>
-                  <td style={{ ...leftCell, borderRight: "none" }} colSpan={COLUMNS.length + 4}>
-                    Add foods to start (like your spreadsheet).
+                  <td className="td left" colSpan={shownNutrientIds.length + 3}>
+                    Add foods above to start building your diet.
                   </td>
                 </tr>
               ) : (
-                computedRows.map((r) => (
-                  <tr key={r.id}>
-                    <td style={leftCell}>{r.foodName}</td>
+                computedDietRows.map((row) => (
+                  <tr key={row.id}>
+                    <td className="td left">{row.name}</td>
 
-                    <td style={cell}>
+                    <td className="td right">
                       <input
+                        className="cellInput"
                         type="number"
-                        value={r.gramsNum}
-                        onChange={(e) => updateRowGrams(r.id, e.target.value)}
-                        style={inputSmall}
+                        min="1"
+                        step="1"
+                        value={row.grams}
+                        onChange={(e) => updateDietRowGrams(row.id, e.target.value)}
                       />
                     </td>
 
-                    {COLUMNS.map((c) => (
-                      <td key={c.key} style={cell}>
-                        {round(r.values[c.key])}
+                    {shownNutrientIds.map((nid) => (
+                      <td key={nid} className="td right">
+                        {round(row.values[nid])}
                       </td>
                     ))}
 
-                    <td style={cell}>
-                      {r.omegaRatio == null ? "-" : round(r.omegaRatio, 3)}
-                    </td>
-
-                    <td style={{ ...cell, borderRight: "none", textAlign: "left" }}>
-                      <button
-                        onClick={() => removeRow(r.id)}
-                        style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid #bbb", cursor: "pointer" }}
-                      >
+                    <td className="td center">
+                      <button className="btn tiny ghost" onClick={() => removeDietRow(row.id)}>
                         remove
                       </button>
                     </td>
@@ -444,76 +527,336 @@ export default function Page() {
                 ))
               )}
 
-              {/* TOTALS row: ✅ nutrition totals ONLY */}
-              {computedRows.length > 0 ? (
+              {/* TOTALS row (nutrients totals) */}
+              {computedDietRows.length > 0 ? (
                 <tr>
-                  <td style={{ ...leftCell, fontWeight: 900 }}>TOTAL</td>
-                  <td style={{ ...cell, fontWeight: 900 }}>{/* keep grams empty or show g total if YOU want */}</td>
-                  {COLUMNS.map((c) => (
-                    <td key={c.key} style={{ ...cell, fontWeight: 900 }}>
-                      {round(totals[c.key])}
+                  <td className="td left totalLabel">TOTALS</td>
+                  <td className="td right totalCell"> </td>
+                  {shownNutrientIds.map((nid) => (
+                    <td
+                      key={nid}
+                      className={`td right totalCell ${exceedsMax(nid) ? "warn" : ""}`}
+                      title={exceedsMax(nid) ? "Exceeded max" : ""}
+                    >
+                      {round(totalsByNutrientId[nid])}
                     </td>
                   ))}
-                  <td style={{ ...cell, fontWeight: 900 }}>—</td>
-                  <td style={{ ...cell, borderRight: "none" }} />
+                  <td className="td center totalCell"> </td>
                 </tr>
               ) : null}
 
-              {/* GOAL row */}
-              {computedRows.length > 0 ? (
+              {/* GOALS row (editable) */}
+              {computedDietRows.length > 0 ? (
                 <tr>
-                  <td style={{ ...leftCell, fontWeight: 800, opacity: 0.85 }}>GOAL</td>
-                  <td style={cell} />
-                  {COLUMNS.map((c) => (
-                    <td key={c.key} style={cell}>
+                  <td className="td left dimLabel">GOAL</td>
+                  <td className="td right dimCell"> </td>
+                  {shownNutrientIds.map((nid) => (
+                    <td key={nid} className="td right dimCell">
                       <input
-                        value={goals[c.key]}
-                        onChange={(e) => updateGoal(c.key, e.target.value)}
+                        className="cellInput"
                         placeholder="-"
-                        style={inputSmall}
+                        value={targets?.[nid]?.goal ?? ""}
+                        onChange={(e) => setTarget(nid, "goal", e.target.value)}
                       />
                     </td>
                   ))}
-                  <td style={cell} />
-                  <td style={{ ...cell, borderRight: "none" }} />
+                  <td className="td center dimCell"> </td>
                 </tr>
               ) : null}
 
-              {/* DIFF row */}
-              {computedRows.length > 0 ? (
+              {/* MAX row (editable) */}
+              {computedDietRows.length > 0 ? (
                 <tr>
-                  <td style={{ ...leftCell, fontWeight: 800, opacity: 0.85 }}>TOTAL − GOAL</td>
-                  <td style={cell} />
-                  {COLUMNS.map((c) => {
-                    const d = diffs[c.key];
-                    const isNumber = d != null;
-                    const over = isNumber && d > 0;
-                    return (
-                      <td
-                        key={c.key}
-                        style={{
-                          ...cell,
-                          fontWeight: 800,
-                          background: over ? "#ffe6e6" : "transparent",
-                        }}
-                      >
-                        {isNumber ? round(d) : "-"}
-                      </td>
-                    );
-                  })}
-                  <td style={cell} />
-                  <td style={{ ...cell, borderRight: "none" }} />
+                  <td className="td left dimLabel">MAX</td>
+                  <td className="td right dimCell"> </td>
+                  {shownNutrientIds.map((nid) => (
+                    <td key={nid} className="td right dimCell">
+                      <input
+                        className="cellInput"
+                        placeholder="-"
+                        value={targets?.[nid]?.max ?? ""}
+                        onChange={(e) => setTarget(nid, "max", e.target.value)}
+                      />
+                    </td>
+                  ))}
+                  <td className="td center dimCell"> </td>
                 </tr>
               ) : null}
             </tbody>
           </table>
         </div>
+      </section>
 
-        {/* Debug hints */}
-        <div style={{ fontSize: 12, opacity: 0.75, marginTop: 10 }}>
-          If some columns show 0 for every food: your nutrients.key names in Supabase might not match the keys in COLUMNS above.
+      {/* Info modal */}
+      {infoModal.open && (
+        <div className="modalBackdrop" onClick={() => setInfoModal({ open: false, nutrient: null })}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modalTitle">
+              {infoModal.nutrient?.display_name || infoModal.nutrient?.key || "Nutrient"}
+            </div>
+            <div className="modalBody">
+              <div className="modalRow">
+                <span className="muted">Unit:</span>{" "}
+                {infoModal.nutrient?.unit || "-"}
+              </div>
+              <div className="modalRow">
+                <span className="muted">Info:</span>{" "}
+                {infoModal.nutrient?.info_text || "No info text yet."}
+              </div>
+              <div className="modalRow">
+                <span className="muted">Default goal:</span>{" "}
+                {infoModal.nutrient?.default_goal ?? "-"}
+              </div>
+              <div className="modalRow">
+                <span className="muted">Default max:</span>{" "}
+                {infoModal.nutrient?.default_max ?? "-"}
+              </div>
+            </div>
+            <div className="modalActions">
+              <button className="btn" onClick={() => setInfoModal({ open: false, nutrient: null })}>
+                Close
+              </button>
+            </div>
+          </div>
         </div>
-      </div>
+      )}
+
+      <style jsx>{`
+        .wrap {
+          padding: 24px;
+          font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+          background: #f7f7fb;
+          min-height: 100vh;
+        }
+        .header {
+          display: flex;
+          justify-content: space-between;
+          gap: 12px;
+          align-items: flex-start;
+          max-width: 1200px;
+          margin: 0 auto 16px auto;
+        }
+        .title {
+          margin: 0;
+          font-size: 26px;
+          letter-spacing: -0.2px;
+        }
+        .subtitle {
+          margin-top: 6px;
+          color: #666;
+          font-size: 13px;
+        }
+        .card {
+          max-width: 1200px;
+          margin: 0 auto 12px auto;
+          background: white;
+          border: 1px solid #e6e6ef;
+          border-radius: 14px;
+          padding: 14px;
+          box-shadow: 0 6px 24px rgba(0,0,0,0.04);
+        }
+        .cardTitle {
+          font-weight: 800;
+          margin-bottom: 10px;
+        }
+        .cardTitleRow {
+          display: flex;
+          justify-content: space-between;
+          align-items: baseline;
+          gap: 12px;
+          margin-bottom: 10px;
+        }
+        .label {
+          display: block;
+          font-size: 12px;
+          font-weight: 700;
+          margin-bottom: 6px;
+          color: #333;
+        }
+        .input {
+          width: 100%;
+          padding: 10px;
+          border-radius: 10px;
+          border: 1px solid #d6d6e6;
+          outline: none;
+        }
+        .hint {
+          font-size: 12px;
+          color: #777;
+          margin-top: 6px;
+        }
+        .error {
+          color: #b00020;
+          font-size: 13px;
+        }
+        .gridAdd {
+          display: grid;
+          grid-template-columns: 1.3fr 1.2fr 0.5fr 0.3fr;
+          gap: 12px;
+          align-items: end;
+        }
+        .addBtnWrap {
+          display: flex;
+          justify-content: flex-end;
+        }
+        .btn {
+          padding: 10px 12px;
+          border-radius: 10px;
+          border: 1px solid #d6d6e6;
+          background: #111827;
+          color: white;
+          cursor: pointer;
+          font-weight: 700;
+        }
+        .btn.ghost {
+          background: white;
+          color: #111827;
+        }
+        .btn.tiny {
+          padding: 6px 10px;
+          border-radius: 10px;
+          font-weight: 700;
+        }
+        .pillWrap {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+        }
+        .pill {
+          border: 1px solid #d6d6e6;
+          background: white;
+          border-radius: 999px;
+          padding: 7px 10px;
+          cursor: pointer;
+          font-size: 12px;
+          font-weight: 700;
+        }
+        .pillOn {
+          background: #111827;
+          color: white;
+          border-color: #111827;
+        }
+        .tableWrap {
+          overflow-x: auto;
+          border: 1px solid #eee;
+          border-radius: 12px;
+        }
+        .table {
+          width: 100%;
+          border-collapse: separate;
+          border-spacing: 0;
+          min-width: 900px;
+        }
+        .th, .td {
+          padding: 10px 10px;
+          border-bottom: 1px solid #eee;
+          border-right: 1px solid #f0f0f0;
+          white-space: nowrap;
+        }
+        .th {
+          background: #fafafa;
+          font-size: 12px;
+          font-weight: 900;
+          position: sticky;
+          top: 0;
+          z-index: 1;
+        }
+        .left { text-align: left; }
+        .right { text-align: right; }
+        .center { text-align: center; }
+        .thFlex {
+          display: inline-flex;
+          gap: 8px;
+          align-items: center;
+          justify-content: flex-end;
+        }
+        .iconBtn {
+          width: 22px;
+          height: 22px;
+          border-radius: 999px;
+          border: 1px solid #d6d6e6;
+          background: white;
+          cursor: pointer;
+          font-weight: 900;
+          line-height: 1;
+        }
+        .cellInput {
+          width: 92px;
+          padding: 7px 8px;
+          border-radius: 10px;
+          border: 1px solid #d6d6e6;
+          text-align: right;
+        }
+        .totalLabel {
+          font-weight: 900;
+        }
+        .totalCell {
+          font-weight: 900;
+          background: #fbfbff;
+        }
+        .dimLabel {
+          font-weight: 900;
+          color: #444;
+        }
+        .dimCell {
+          background: #fcfcfc;
+        }
+        .warn {
+          background: #ffe9e9 !important;
+          color: #9b0000;
+        }
+        .modalBackdrop {
+          position: fixed;
+          inset: 0;
+          background: rgba(0,0,0,0.35);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 18px;
+        }
+        .modal {
+          background: white;
+          width: 520px;
+          max-width: 100%;
+          border-radius: 14px;
+          border: 1px solid #e6e6ef;
+          box-shadow: 0 20px 60px rgba(0,0,0,0.25);
+          padding: 14px;
+        }
+        .modalTitle {
+          font-weight: 900;
+          font-size: 16px;
+          margin-bottom: 10px;
+        }
+        .modalBody {
+          font-size: 13px;
+          color: #222;
+          line-height: 1.5;
+        }
+        .modalRow {
+          margin-bottom: 8px;
+        }
+        .muted {
+          color: #666;
+          font-weight: 800;
+        }
+        .modalActions {
+          display: flex;
+          justify-content: flex-end;
+          margin-top: 10px;
+        }
+        @media (max-width: 900px) {
+          .gridAdd {
+            grid-template-columns: 1fr;
+          }
+          .addBtnWrap {
+            justify-content: stretch;
+          }
+          .btn {
+            width: 100%;
+          }
+        }
+      `}</style>
     </main>
   );
 }
