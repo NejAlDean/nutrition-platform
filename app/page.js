@@ -1,66 +1,71 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { supabase } from "../lib/supabaseClient"; // lib is next to app
+import { supabase } from "../lib/supabaseClient";
 
-function round2(n) {
-  if (n == null || Number.isNaN(n)) return 0;
-  return Math.round(n * 100) / 100;
-}
+/**
+ * IMPORTANT:
+ * This app assumes:
+ * - foods_global(id, name, price_per_100g)
+ * - food_nutrients_global(food_id, nutrient_id, amount_per_100g)
+ * - nutrients(id, key, display_name, unit)
+ *
+ * We will build the spreadsheet columns using nutrients.key.
+ */
 
-// Which nutrients you want as columns (spreadsheet style)
-// These must match nutrients.key in your Supabase table `nutrients`.
-const DEFAULT_VISIBLE_KEYS = [
-  "calories",
-  "protein",
-  "carbs",
-  "fat",
-  "fiber",
-  "sugar",
-  "omega_3",
-  "omega_6",
-  "cholesterol",
-  "sodium",
+// ✅ EDIT THIS LIST to match your spreadsheet columns (order matters).
+// These keys must exist in nutrients.key.
+const COLUMNS = [
+  { key: "calories", label: "Kcal" },
+  { key: "protein", label: "Protein" },
+  { key: "carbs", label: "Carbs" },
+  { key: "fat", label: "Fat" },
+  { key: "fiber", label: "Fiber" },
+  { key: "sugar", label: "Sugar" },
+  { key: "cholesterol", label: "Cholesterol" },
+  { key: "omega_3", label: "Omega-3" },
+  { key: "omega_6", label: "Omega-6" },
 ];
 
-export default function Home() {
-  // Foods list
+function round(n, digits = 2) {
+  if (n == null || Number.isNaN(n)) return 0;
+  const p = 10 ** digits;
+  return Math.round(n * p) / p;
+}
+
+export default function Page() {
+  // Foods
   const [foods, setFoods] = useState([]);
   const [foodsLoading, setFoodsLoading] = useState(true);
   const [foodsError, setFoodsError] = useState(null);
 
-  // Search + add
+  // Nutrients meta
+  const [nutrientIdByKey, setNutrientIdByKey] = useState({});
+  const [nutrientMetaById, setNutrientMetaById] = useState({}); // id -> {key,name,unit}
+
+  // food nutrients (for selected foods only)
+  const [foodNutrients, setFoodNutrients] = useState([]);
+
+  // Add UI
   const [query, setQuery] = useState("");
   const [selectedFoodId, setSelectedFoodId] = useState("");
   const [grams, setGrams] = useState(100);
 
-  // Entries in "diet"
-  const [entries, setEntries] = useState([]); // [{ id, food_id, name, grams }]
+  // Spreadsheet rows
+  const [rows, setRows] = useState([]); // [{id, food_id, grams}]
 
-  // Nutrient metadata + nutrient rows for selected foods
-  const [nutrientsById, setNutrientsById] = useState({}); // id -> { key, name, unit }
-  const [nutrientIdByKey, setNutrientIdByKey] = useState({}); // key -> id
-  const [foodNutrients, setFoodNutrients] = useState([]); // { food_id, nutrient_id, amount_per_100g }
-
-  // UI: visible nutrient columns (by key)
-  const [visibleKeys, setVisibleKeys] = useState(DEFAULT_VISIBLE_KEYS);
-
-  // UI: goals for each nutrient key
-  const [goalsByKey, setGoalsByKey] = useState(() => {
-    const obj = {};
-    for (const k of DEFAULT_VISIBLE_KEYS) obj[k] = "";
-    return obj;
+  // Goals (per nutrient key)
+  const [goals, setGoals] = useState(() => {
+    const g = {};
+    for (const c of COLUMNS) g[c.key] = "";
+    return g;
   });
 
-  const supabaseUrlPresent = !!process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const supabaseAnonPresent = !!process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-
-  // ----------------------------
-  // A) Load all foods (global)
-  // ----------------------------
+  // -----------------------------
+  // Load foods
+  // -----------------------------
   useEffect(() => {
     let cancelled = false;
-
     (async () => {
       setFoodsLoading(true);
       setFoodsError(null);
@@ -78,7 +83,6 @@ export default function Home() {
       } else {
         setFoods(data || []);
       }
-
       setFoodsLoading(false);
     })();
 
@@ -87,7 +91,96 @@ export default function Home() {
     };
   }, []);
 
-  // Dropdown foods filtered
+  const foodById = useMemo(() => {
+    const m = {};
+    for (const f of foods) m[f.id] = f;
+    return m;
+  }, [foods]);
+
+  // -----------------------------
+  // Load nutrients meta (once)
+  // -----------------------------
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from("nutrients")
+        .select("id,key,display_name,unit");
+
+      if (cancelled) return;
+
+      if (error) {
+        console.error(error);
+        setNutrientIdByKey({});
+        setNutrientMetaById({});
+        return;
+      }
+
+      const byKey = {};
+      const byId = {};
+
+      for (const n of data || []) {
+        byKey[n.key] = n.id;
+        byId[n.id] = {
+          key: n.key,
+          name: n.display_name || n.key,
+          unit: n.unit || "",
+        };
+      }
+
+      setNutrientIdByKey(byKey);
+      setNutrientMetaById(byId);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // -----------------------------
+  // Load nutrient rows for foods that are in the sheet
+  // -----------------------------
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const foodIds = Array.from(new Set(rows.map((r) => r.food_id)));
+      if (foodIds.length === 0) {
+        setFoodNutrients([]);
+        return;
+      }
+
+      const { data, error } = await supabase
+        .from("food_nutrients_global")
+        .select("food_id,nutrient_id,amount_per_100g")
+        .in("food_id", foodIds);
+
+      if (cancelled) return;
+
+      if (error) {
+        console.error(error);
+        setFoodNutrients([]);
+        return;
+      }
+
+      setFoodNutrients(data || []);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [rows]);
+
+  // Lookup: food_id -> nutrient_id -> amount_per_100g
+  const amount100 = useMemo(() => {
+    const m = {};
+    for (const r of foodNutrients) {
+      if (!m[r.food_id]) m[r.food_id] = {};
+      m[r.food_id][r.nutrient_id] = Number(r.amount_per_100g || 0);
+    }
+    return m;
+  }, [foodNutrients]);
+
+  // Dropdown filtering
   const filteredFoods = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return foods.slice(0, 200);
@@ -96,160 +189,71 @@ export default function Home() {
       .slice(0, 200);
   }, [foods, query]);
 
-  // id -> name
-  const foodNameById = useMemo(() => {
-    const map = {};
-    for (const f of foods) map[f.id] = f.name;
-    return map;
-  }, [foods]);
+  // -----------------------------
+  // Spreadsheet computed values
+  // -----------------------------
+  const computedRows = useMemo(() => {
+    return rows.map((r) => {
+      const food = foodById[r.food_id];
+      const gramsNum = Number(r.grams || 0);
 
-  // ----------------------------
-  // B) Load nutrient meta once
-  // ----------------------------
-  useEffect(() => {
-    let cancelled = false;
-
-    (async () => {
-      // Load all nutrients (we need key + display_name + unit)
-      const { data, error } = await supabase
-        .from("nutrients")
-        .select("id,key,display_name,unit");
-
-      if (cancelled) return;
-
-      if (error) {
-        console.error("nutrients load error:", error);
-        setNutrientsById({});
-        setNutrientIdByKey({});
-        return;
+      const values = {};
+      for (const c of COLUMNS) {
+        const nid = nutrientIdByKey[c.key];
+        const v100 = nid ? Number(amount100[r.food_id]?.[nid] || 0) : 0;
+        values[c.key] = (v100 * gramsNum) / 100;
       }
 
-      const byId = {};
-      const byKey = {};
+      // omega ratio (if both present)
+      const o3 = values["omega_3"] || 0;
+      const o6 = values["omega_6"] || 0;
+      const ratio = o3 > 0 ? o6 / o3 : null;
 
-      for (const n of data || []) {
-        byId[n.id] = {
-          key: n.key,
-          name: n.display_name || n.key,
-          unit: n.unit || "",
-        };
-        if (n.key) byKey[n.key] = n.id;
-      }
-
-      setNutrientsById(byId);
-      setNutrientIdByKey(byKey);
-
-      // Auto-fix: remove keys that do not exist in DB
-      setVisibleKeys((prev) => prev.filter((k) => !!byKey[k]));
-      setGoalsByKey((prev) => {
-        const next = { ...prev };
-        for (const k of Object.keys(next)) {
-          if (!byKey[k]) delete next[k];
-        }
-        // Ensure we have goal fields for current visible keys
-        for (const k of DEFAULT_VISIBLE_KEYS) {
-          if (byKey[k] && next[k] === undefined) next[k] = "";
-        }
-        return next;
-      });
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // ----------------------------
-  // C) When entries change, load nutrient rows for those foods
-  // ----------------------------
-  useEffect(() => {
-    let cancelled = false;
-
-    (async () => {
-      const foodIds = Array.from(new Set(entries.map((e) => e.food_id)));
-      if (foodIds.length === 0) {
-        setFoodNutrients([]);
-        return;
-      }
-
-      const { data: fnData, error: fnError } = await supabase
-        .from("food_nutrients_global")
-        .select("food_id,nutrient_id,amount_per_100g")
-        .in("food_id", foodIds);
-
-      if (cancelled) return;
-
-      if (fnError) {
-        console.error(fnError);
-        setFoodNutrients([]);
-        return;
-      }
-
-      setFoodNutrients(fnData || []);
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [entries]);
-
-  // ----------------------------
-  // D) Build a fast lookup: food_id -> nutrient_id -> amount_per_100g
-  // ----------------------------
-  const amount100ByFoodNutrient = useMemo(() => {
-    const map = {}; // food_id -> { nutrient_id: amount_per_100g }
-    for (const row of foodNutrients) {
-      if (!map[row.food_id]) map[row.food_id] = {};
-      map[row.food_id][row.nutrient_id] = Number(row.amount_per_100g || 0);
-    }
-    return map;
-  }, [foodNutrients]);
-
-  // ----------------------------
-  // E) Spreadsheet rows (each entry becomes one row)
-  // ----------------------------
-  const spreadsheetRows = useMemo(() => {
-    return entries.map((e) => {
-      const foodMap = amount100ByFoodNutrient[e.food_id] || {};
-      const gramsNum = Number(e.grams || 0);
-
-      // For each visible nutrient key, compute value
-      const valuesByKey = {};
-      for (const key of visibleKeys) {
-        const nid = nutrientIdByKey[key];
-        const amount100 = nid ? Number(foodMap[nid] || 0) : 0;
-        valuesByKey[key] = (amount100 * gramsNum) / 100;
-      }
-
-      return { ...e, grams: gramsNum, valuesByKey };
+      return {
+        ...r,
+        foodName: food?.name || "Unknown food",
+        price_per_100g: food?.price_per_100g ?? null,
+        gramsNum,
+        values,
+        omegaRatio: ratio,
+      };
     });
-  }, [entries, amount100ByFoodNutrient, visibleKeys, nutrientIdByKey]);
+  }, [rows, foodById, nutrientIdByKey, amount100]);
 
-  // ----------------------------
-  // F) Totals row per nutrient key
-  // ----------------------------
-  const totalsByKey = useMemo(() => {
-    const totals = {};
-    for (const k of visibleKeys) totals[k] = 0;
-    for (const row of spreadsheetRows) {
-      for (const k of visibleKeys) {
-        totals[k] += Number(row.valuesByKey[k] || 0);
+  // Totals per nutrient
+  const totals = useMemo(() => {
+    const t = {};
+    for (const c of COLUMNS) t[c.key] = 0;
+
+    for (const r of computedRows) {
+      for (const c of COLUMNS) t[c.key] += Number(r.values[c.key] || 0);
+    }
+    return t;
+  }, [computedRows]);
+
+  // Goal diff (total - goal)
+  const diffs = useMemo(() => {
+    const d = {};
+    for (const c of COLUMNS) {
+      const goal = Number(goals[c.key]);
+      if (!Number.isFinite(goal)) {
+        d[c.key] = null;
+      } else {
+        d[c.key] = totals[c.key] - goal;
       }
     }
-    return totals;
-  }, [spreadsheetRows, visibleKeys]);
+    return d;
+  }, [goals, totals]);
 
-  // ----------------------------
+  // -----------------------------
   // Actions
-  // ----------------------------
-  function addEntry() {
+  // -----------------------------
+  function addFoodRow() {
     const g = Number(grams);
     if (!selectedFoodId) return;
     if (!Number.isFinite(g) || g <= 0) return;
 
-    const name = foodNameById[selectedFoodId] || "Unknown food";
-
-    setEntries((prev) => [
+    setRows((prev) => [
       ...prev,
       {
         id:
@@ -257,275 +261,259 @@ export default function Home() {
             ? crypto.randomUUID()
             : String(Date.now()) + Math.random(),
         food_id: selectedFoodId,
-        name,
         grams: g,
       },
     ]);
   }
 
-  function removeEntry(entryId) {
-    setEntries((prev) => prev.filter((e) => e.id !== entryId));
+  function removeRow(id) {
+    setRows((prev) => prev.filter((r) => r.id !== id));
   }
 
-  function updateEntryGrams(entryId, newGrams) {
-    const g = Number(newGrams);
-    setEntries((prev) =>
-      prev.map((e) => (e.id === entryId ? { ...e, grams: g } : e))
-    );
+  function updateRowGrams(id, value) {
+    const g = Number(value);
+    setRows((prev) => prev.map((r) => (r.id === id ? { ...r, grams: g } : r)));
   }
 
   function updateGoal(key, value) {
-    setGoalsByKey((prev) => ({ ...prev, [key]: value }));
+    setGoals((prev) => ({ ...prev, [key]: value }));
   }
 
-  // ----------------------------
-  // Styling (simple, clean)
-  // ----------------------------
-  const card = {
+  // -----------------------------
+  // Styles: spreadsheet feel
+  // -----------------------------
+  const box = {
     border: "1px solid #ddd",
     borderRadius: 10,
-    padding: 16,
     background: "#fff",
   };
 
-  const input = {
-    width: "100%",
-    padding: 10,
-    borderRadius: 8,
-    border: "1px solid #ccc",
-  };
-
-  const btn = {
-    padding: "10px 14px",
-    borderRadius: 8,
-    border: "1px solid #bbb",
-    cursor: "pointer",
-    background: "#f7f7f7",
-  };
-
-  const tableCell = {
+  const cell = {
+    padding: "10px 10px",
     borderBottom: "1px solid #eee",
-    padding: 10,
-    verticalAlign: "top",
+    borderRight: "1px solid #eee",
+    textAlign: "right",
     whiteSpace: "nowrap",
   };
 
-  // Highlight if above goal
-  function isAboveGoal(key, totalValue) {
-    const raw = goalsByKey[key];
-    if (raw === "" || raw == null) return false;
-    const goal = Number(raw);
-    if (!Number.isFinite(goal)) return false;
-    return totalValue > goal;
-  }
+  const headCell = {
+    ...cell,
+    fontWeight: 800,
+    background: "#f5f5f5",
+    position: "sticky",
+    top: 0,
+    zIndex: 1,
+  };
+
+  const leftCell = { ...cell, textAlign: "left" };
+
+  const inputSmall = {
+    width: 90,
+    padding: 6,
+    borderRadius: 8,
+    border: "1px solid #ccc",
+    textAlign: "right",
+  };
 
   return (
     <main style={{ padding: 24, fontFamily: "system-ui, Arial", background: "#fafafa" }}>
       <div style={{ maxWidth: 1200, margin: "0 auto" }}>
-        <h1 style={{ margin: "0 0 10px 0" }}>Nutrition Platform</h1>
+        <h1 style={{ margin: 0 }}>Nutrition Platform</h1>
 
-        <div style={{ marginBottom: 16, fontSize: 13, opacity: 0.85 }}>
-          <div>Supabase URL present: {supabaseUrlPresent ? "Yes" : "No"}</div>
-          <div>Anon key present: {supabaseAnonPresent ? "Yes" : "No"}</div>
-        </div>
+        {/* ADD ROW (simple + aligned) */}
+        <div style={{ ...box, padding: 16, marginTop: 16 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1.2fr 0.4fr 0.25fr", gap: 12, alignItems: "end" }}>
+            <div>
+              <div style={{ fontWeight: 800, marginBottom: 6 }}>Search</div>
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Type to filter foods…"
+                style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ccc" }}
+              />
+            </div>
 
-        {/* ADD FOOD */}
-        <section style={{ ...card, marginBottom: 16 }}>
-          <h2 style={{ margin: "0 0 12px 0" }}>Add food</h2>
-
-          {foodsLoading ? (
-            <p>Loading foods…</p>
-          ) : foodsError ? (
-            <p style={{ color: "crimson" }}>Error loading foods: {foodsError}</p>
-          ) : (
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "1.2fr 1.4fr 0.6fr 0.3fr",
-                gap: 12,
-                alignItems: "end",
-              }}
-            >
-              <div>
-                <label style={{ display: "block", fontWeight: 700, marginBottom: 6 }}>
-                  Search
-                </label>
-                <input
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  placeholder="Type to filter foods…"
-                  style={input}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: "block", fontWeight: 700, marginBottom: 6 }}>
-                  Food
-                </label>
+            <div>
+              <div style={{ fontWeight: 800, marginBottom: 6 }}>Food</div>
+              {foodsLoading ? (
+                <div>Loading…</div>
+              ) : foodsError ? (
+                <div style={{ color: "crimson" }}>{foodsError}</div>
+              ) : (
                 <select
                   value={selectedFoodId}
                   onChange={(e) => setSelectedFoodId(e.target.value)}
-                  style={input}
+                  style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ccc" }}
                 >
-                  <option value="">Select a food…</option>
+                  <option value="">Select…</option>
                   {filteredFoods.map((f) => (
                     <option key={f.id} value={f.id}>
                       {f.name}
                     </option>
                   ))}
                 </select>
-                <div style={{ fontSize: 12, opacity: 0.75, marginTop: 6 }}>
-                  Showing {filteredFoods.length} foods (max 200 in dropdown)
-                </div>
-              </div>
-
-              <div>
-                <label style={{ display: "block", fontWeight: 700, marginBottom: 6 }}>
-                  Grams
-                </label>
-                <input
-                  type="number"
-                  value={grams}
-                  onChange={(e) => setGrams(e.target.value)}
-                  min={1}
-                  step={1}
-                  style={input}
-                />
-              </div>
-
-              <div>
-                <button onClick={addEntry} style={{ ...btn, width: "100%" }}>
-                  Add
-                </button>
+              )}
+              <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
+                Showing {filteredFoods.length} foods (max 200)
               </div>
             </div>
-          )}
-        </section>
 
-        {/* SPREADSHEET TABLE */}
-        <section style={card}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12 }}>
-            <h2 style={{ margin: "0 0 12px 0" }}>Diet Spreadsheet</h2>
-            <div style={{ fontSize: 12, opacity: 0.75 }}>
-              Formula: amount_per_100g × grams/100
+            <div>
+              <div style={{ fontWeight: 800, marginBottom: 6 }}>Grams</div>
+              <input
+                type="number"
+                value={grams}
+                onChange={(e) => setGrams(e.target.value)}
+                min={1}
+                step={1}
+                style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ccc" }}
+              />
             </div>
+
+            <button
+              onClick={addFoodRow}
+              style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #bbb", cursor: "pointer" }}
+            >
+              Add
+            </button>
           </div>
+        </div>
 
-          {/* Table */}
-          <div style={{ overflowX: "auto" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 900 }}>
-              <thead>
+        {/* SPREADSHEET */}
+        <div style={{ ...box, marginTop: 16, overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: 0, minWidth: 1000 }}>
+            <thead>
+              <tr>
+                <th style={{ ...headCell, textAlign: "left" }}>Food</th>
+                <th style={headCell}>g</th>
+                {COLUMNS.map((c) => {
+                  const id = nutrientIdByKey[c.key];
+                  const meta = id ? nutrientMetaById[id] : null;
+                  const unit = meta?.unit ? ` (${meta.unit})` : "";
+                  return (
+                    <th key={c.key} style={headCell}>
+                      {c.label}{unit}
+                    </th>
+                  );
+                })}
+                <th style={headCell}>Ω6/Ω3</th>
+                <th style={{ ...headCell, borderRight: "none" }} />
+              </tr>
+            </thead>
+
+            <tbody>
+              {computedRows.length === 0 ? (
                 <tr>
-                  <th style={{ ...tableCell, textAlign: "left" }}>Food</th>
-                  <th style={{ ...tableCell, textAlign: "right" }}>Grams</th>
-                  {visibleKeys.map((k) => {
-                    const nid = nutrientIdByKey[k];
-                    const meta = nid ? nutrientsById[nid] : null;
-                    return (
-                      <th key={k} style={{ ...tableCell, textAlign: "right" }}>
-                        {meta?.name || k}
-                        {meta?.unit ? <div style={{ fontSize: 11, opacity: 0.7 }}>{meta.unit}</div> : null}
-                      </th>
-                    );
-                  })}
-                  <th style={{ ...tableCell, textAlign: "left" }} />
+                  <td style={{ ...leftCell, borderRight: "none" }} colSpan={COLUMNS.length + 4}>
+                    Add foods to start (like your spreadsheet).
+                  </td>
                 </tr>
-              </thead>
+              ) : (
+                computedRows.map((r) => (
+                  <tr key={r.id}>
+                    <td style={leftCell}>{r.foodName}</td>
 
-              <tbody>
-                {spreadsheetRows.length === 0 ? (
-                  <tr>
-                    <td colSpan={3 + visibleKeys.length} style={{ padding: 14, opacity: 0.75 }}>
-                      No entries yet. Add a food + grams above.
+                    <td style={cell}>
+                      <input
+                        type="number"
+                        value={r.gramsNum}
+                        onChange={(e) => updateRowGrams(r.id, e.target.value)}
+                        style={inputSmall}
+                      />
                     </td>
-                  </tr>
-                ) : (
-                  spreadsheetRows.map((row) => (
-                    <tr key={row.id}>
-                      <td style={{ ...tableCell, textAlign: "left" }}>{row.name}</td>
-                      <td style={{ ...tableCell, textAlign: "right" }}>
-                        <input
-                          type="number"
-                          value={row.grams}
-                          min={1}
-                          step={1}
-                          onChange={(e) => updateEntryGrams(row.id, e.target.value)}
-                          style={{ width: 110, padding: 8, borderRadius: 8, border: "1px solid #ccc", textAlign: "right" }}
-                        />
-                     l哄
-                      </td>
-                      {visibleKeys.map((k) => (
-                        <td key={k} style={{ ...tableCell, textAlign: "right" }}>
-                          {round2(row.valuesByKey[k])}
-                        </td>
-                      ))}
-                      <td style={{ ...tableCell, textAlign: "left" }}>
-                        <button onClick={() => removeEntry(row.id)} style={{ ...btn, padding: "8px 10px" }}>
-                          remove
-                        </button>
-                      </td>
-                    </tr>
-                  ))
-                )}
 
-                {/* TOTALS ROW */}
-                {spreadsheetRows.length > 0 ? (
-                  <tr>
-                    <td style={{ ...tableCell, fontWeight: 800 }}>TOTAL</td>
-                    <td style={{ ...tableCell, textAlign: "right", fontWeight: 800 }}>
-                      {round2(spreadsheetRows.reduce((sum, r) => sum + (r.grams || 0), 0))}
-                    </td>
-                    {visibleKeys.map((k) => {
-                      const v = totalsByKey[k] || 0;
-                      const warn = isAboveGoal(k, v);
-                      return (
-                        <td
-                          key={k}
-                          style={{
-                            ...tableCell,
-                            textAlign: "right",
-                            fontWeight: 800,
-                            background: warn ? "#ffe6e6" : "transparent",
-                          }}
-                          title={warn ? "Above goal" : ""}
-                        >
-                          {round2(v)}
-                        </td>
-                      );
-                    })}
-                    <td style={tableCell} />
-                  </tr>
-                ) : null}
-
-                {/* GOALS ROW (editable) */}
-                {spreadsheetRows.length > 0 ? (
-                  <tr>
-                    <td style={{ ...tableCell, fontWeight: 700, opacity: 0.9 }}>GOAL</td>
-                    <td style={{ ...tableCell }} />
-                    {visibleKeys.map((k) => (
-                      <td key={k} style={{ ...tableCell, textAlign: "right" }}>
-                        <input
-                          value={goalsByKey[k] ?? ""}
-                          onChange={(e) => updateGoal(k, e.target.value)}
-                          placeholder="-"
-                          style={{ width: 110, padding: 8, borderRadius: 8, border: "1px solid #ccc", textAlign: "right" }}
-                        />
+                    {COLUMNS.map((c) => (
+                      <td key={c.key} style={cell}>
+                        {round(r.values[c.key])}
                       </td>
                     ))}
-                    <td style={tableCell} />
-                  </tr>
-                ) : null}
-              </tbody>
-            </table>
-          </div>
 
-          {/* Helpful hint */}
-          <div style={{ marginTop: 12, fontSize: 12, opacity: 0.75 }}>
-            If totals are still empty: check that your table <b>food_nutrients_global</b> contains rows for the foods you selected and the nutrients you want.
-          </div>
-        </section>
+                    <td style={cell}>
+                      {r.omegaRatio == null ? "-" : round(r.omegaRatio, 3)}
+                    </td>
+
+                    <td style={{ ...cell, borderRight: "none", textAlign: "left" }}>
+                      <button
+                        onClick={() => removeRow(r.id)}
+                        style={{ padding: "6px 10px", borderRadius: 10, border: "1px solid #bbb", cursor: "pointer" }}
+                      >
+                        remove
+                      </button>
+                    </td>
+                  </tr>
+                ))
+              )}
+
+              {/* TOTALS row: ✅ nutrition totals ONLY */}
+              {computedRows.length > 0 ? (
+                <tr>
+                  <td style={{ ...leftCell, fontWeight: 900 }}>TOTAL</td>
+                  <td style={{ ...cell, fontWeight: 900 }}>{/* keep grams empty or show g total if YOU want */}</td>
+                  {COLUMNS.map((c) => (
+                    <td key={c.key} style={{ ...cell, fontWeight: 900 }}>
+                      {round(totals[c.key])}
+                    </td>
+                  ))}
+                  <td style={{ ...cell, fontWeight: 900 }}>—</td>
+                  <td style={{ ...cell, borderRight: "none" }} />
+                </tr>
+              ) : null}
+
+              {/* GOAL row */}
+              {computedRows.length > 0 ? (
+                <tr>
+                  <td style={{ ...leftCell, fontWeight: 800, opacity: 0.85 }}>GOAL</td>
+                  <td style={cell} />
+                  {COLUMNS.map((c) => (
+                    <td key={c.key} style={cell}>
+                      <input
+                        value={goals[c.key]}
+                        onChange={(e) => updateGoal(c.key, e.target.value)}
+                        placeholder="-"
+                        style={inputSmall}
+                      />
+                    </td>
+                  ))}
+                  <td style={cell} />
+                  <td style={{ ...cell, borderRight: "none" }} />
+                </tr>
+              ) : null}
+
+              {/* DIFF row */}
+              {computedRows.length > 0 ? (
+                <tr>
+                  <td style={{ ...leftCell, fontWeight: 800, opacity: 0.85 }}>TOTAL − GOAL</td>
+                  <td style={cell} />
+                  {COLUMNS.map((c) => {
+                    const d = diffs[c.key];
+                    const isNumber = d != null;
+                    const over = isNumber && d > 0;
+                    return (
+                      <td
+                        key={c.key}
+                        style={{
+                          ...cell,
+                          fontWeight: 800,
+                          background: over ? "#ffe6e6" : "transparent",
+                        }}
+                      >
+                        {isNumber ? round(d) : "-"}
+                      </td>
+                    );
+                  })}
+                  <td style={cell} />
+                  <td style={{ ...cell, borderRight: "none" }} />
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Debug hints */}
+        <div style={{ fontSize: 12, opacity: 0.75, marginTop: 10 }}>
+          If some columns show 0 for every food: your nutrients.key names in Supabase might not match the keys in COLUMNS above.
+        </div>
       </div>
     </main>
   );
 }
-
